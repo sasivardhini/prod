@@ -18,9 +18,11 @@ go.work
 
 # Data files
 data/*.tsv
+data/*.tsv.gz
 data/*.csv
 data/*.json
 !data/.gitkeep
+!data/sample-ip2asn-v4.tsv
 
 # Config files with secrets
 configs/*.secret.*
