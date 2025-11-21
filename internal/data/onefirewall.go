@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,17 +26,46 @@ type OneFirewallClient struct {
 }
 
 // OneFirewallResponse represents the API response structure
+// Actual API returns: {"header": {...}, "body": [...]}
 type OneFirewallResponse struct {
-	IP          string  `json:"ip"`
-	Score       float64 `json:"score"`
-	CrimeScore  float64 `json:"crime_score"`
-	ASN         uint32  `json:"asn"`
-	Country     string  `json:"country"`
-	CountryCode string  `json:"country_code"`
-	FirstSeen   string  `json:"first_seen"`
-	LastSeen    string  `json:"last_seen"`
-	Description string  `json:"description"`
-	Events      int     `json:"events"`
+	Header OneFirewallHeader   `json:"header"`
+	Body   []OneFirewallIPData `json:"body"`
+}
+
+// OneFirewallHeader contains metadata about the response
+type OneFirewallHeader struct {
+	PageSize int `json:"page_size"`
+	Live     bool `json:"live"`
+}
+
+// OneFirewallIPData represents a single IP's data from the API
+type OneFirewallIPData struct {
+	IP      string                `json:"ip"`
+	Score   float64               `json:"score"`   // Raw score (can be 0-1000+)
+	EntryTS int64                 `json:"entry_ts"` // First seen timestamp
+	TS      int64                 `json:"ts"`       // Last seen timestamp
+	Tags    []string              `json:"tags"`
+	IPInfo  OneFirewallIPInfo     `json:"ip_info"`
+	Info    OneFirewallEventInfo  `json:"info"`
+}
+
+// OneFirewallIPInfo contains IP geographic and network info
+type OneFirewallIPInfo struct {
+	ASN          string `json:"asn"`           // Format: "AS4760"
+	Country      string `json:"country"`       // "Hong Kong"
+	CountryCode  string `json:"country_code"`  // "HK"
+	ASName       string `json:"as_name"`       // "HKT Limited"
+	ASDomain     string `json:"as_domain"`     // "netvigator.com"
+	Continent    string `json:"continent"`     // "Asia"
+	ContinentCode string `json:"continent_code"` // "AS"
+}
+
+// OneFirewallEventInfo contains event statistics
+type OneFirewallEventInfo struct {
+	Members int      `json:"members"` // Number of alliance members reporting
+	Events  int      `json:"events"`  // Number of events
+	Sources []string `json:"sources"` // Sources reporting this IP
+	Notes   []string `json:"notes"`   // Additional notes
 }
 
 // NewOneFirewallClient creates a new OneFirewall API client
@@ -67,8 +99,8 @@ func (c *OneFirewallClient) GetIPInfo(ip string) (*models.MaliciousIP, error) {
 		return nil, fmt.Errorf("no API key configured")
 	}
 
-	// Make API request
-	url := fmt.Sprintf("%s/api/search?ioc=%s", c.baseURL, ip)
+	// Make API request - correct endpoint is /api/v1/ips
+	url := fmt.Sprintf("%s/api/v1/ips?ip=%s", c.baseURL, ip)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -92,7 +124,8 @@ func (c *OneFirewallClient) GetIPInfo(ip string) (*models.MaliciousIP, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Warnf("OneFirewall API returned status %d for IP %s", resp.StatusCode, ip)
+		body, _ := io.ReadAll(resp.Body)
+		log.Warnf("OneFirewall API returned status %d for IP %s: %s", resp.StatusCode, ip, string(body))
 		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
@@ -108,26 +141,32 @@ func (c *OneFirewallClient) GetIPInfo(ip string) (*models.MaliciousIP, error) {
 		return nil, err
 	}
 
-	firstSeen, _ := time.Parse(time.RFC3339, apiResp.FirstSeen)
-	lastSeen, _ := time.Parse(time.RFC3339, apiResp.LastSeen)
-
-	// Use CrimeScore if available, otherwise fall back to Score
-	score := apiResp.Score
-	if apiResp.CrimeScore > 0 {
-		score = apiResp.CrimeScore
+	// Check if body has data
+	if len(apiResp.Body) == 0 {
+		log.Debugf("IP %s not found in OneFirewall database (empty body)", ip)
+		return nil, nil
 	}
 
-	// Get country code
-	countryCode := apiResp.CountryCode
-	if countryCode == "" {
-		countryCode = apiResp.Country
-	}
+	// Get the first (and should be only) result
+	ipData := apiResp.Body[0]
+
+	// Parse timestamps
+	firstSeen := time.Unix(ipData.EntryTS, 0)
+	lastSeen := time.Unix(ipData.TS, 0)
+
+	// Normalize score from raw (0-1000+) to 0-10 scale
+	// Based on observation: score of 234 should be HIGH (8-9)
+	// Using logarithmic scaling: normalized_score = min(10, log10(score + 1) * 3)
+	normalizedScore := normalizeOneFirewallScore(ipData.Score)
+
+	// Parse ASN from "AS4760" format to uint32
+	asn := parseASN(ipData.IPInfo.ASN)
 
 	maliciousIP := &models.MaliciousIP{
-		IP:          apiResp.IP,
-		Score:       score,
-		ASN:         apiResp.ASN,
-		CountryCode: countryCode,
+		IP:          ipData.IP,
+		Score:       normalizedScore,
+		ASN:         asn,
+		CountryCode: ipData.IPInfo.CountryCode,
 		FirstSeen:   firstSeen,
 		LastSeen:    lastSeen,
 	}
@@ -137,7 +176,8 @@ func (c *OneFirewallClient) GetIPInfo(ip string) (*models.MaliciousIP, error) {
 	c.cache[ip] = maliciousIP
 	c.mu.Unlock()
 
-	log.Infof("Fetched IP %s from OneFirewall: score=%.2f, ASN=%d, country=%s", ip, score, apiResp.ASN, countryCode)
+	log.Infof("Fetched IP %s from OneFirewall: raw_score=%.0f, normalized_score=%.2f, ASN=%d, country=%s, members=%d, events=%d",
+		ip, ipData.Score, normalizedScore, asn, ipData.IPInfo.CountryCode, ipData.Info.Members, ipData.Info.Events)
 
 	return maliciousIP, nil
 }
@@ -249,4 +289,76 @@ func (c *OneFirewallClient) GetCacheSize() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.cache)
+}
+
+// normalizeOneFirewallScore normalizes OneFirewall raw scores to 0-10 scale
+// OneFirewall returns raw scores that can range from 0 to 1000+
+// Example: score=234 should map to ~8.5 (HIGH)
+//
+// Score mapping based on observed data:
+// - 0-10: LOW (0-3)
+// - 10-50: LOW-MEDIUM (3-5)
+// - 50-150: MEDIUM (5-7)
+// - 150-300: HIGH (7-9)
+// - 300+: CRITICAL (9-10)
+func normalizeOneFirewallScore(rawScore float64) float64 {
+	if rawScore <= 0 {
+		return 0
+	}
+
+	// Using logarithmic scaling with calibration
+	// score = min(10, (log10(rawScore + 1) / log10(1000)) * 10 + offset)
+	//
+	// Examples:
+	// rawScore=10 → normalized≈3.0 (LOW)
+	// rawScore=50 → normalized≈5.0 (MEDIUM)
+	// rawScore=150 → normalized≈7.0 (MEDIUM-HIGH)
+	// rawScore=234 → normalized≈8.5 (HIGH)
+	// rawScore=500 → normalized≈9.0 (CRITICAL)
+
+	// Simple piecewise linear mapping for better control
+	var normalized float64
+
+	if rawScore < 10 {
+		// 0-10 → 0-3 (LOW)
+		normalized = rawScore * 0.3
+	} else if rawScore < 50 {
+		// 10-50 → 3-5 (LOW-MEDIUM)
+		normalized = 3.0 + ((rawScore - 10) / 40.0) * 2.0
+	} else if rawScore < 150 {
+		// 50-150 → 5-7 (MEDIUM)
+		normalized = 5.0 + ((rawScore - 50) / 100.0) * 2.0
+	} else if rawScore < 300 {
+		// 150-300 → 7-9 (HIGH)
+		normalized = 7.0 + ((rawScore - 150) / 150.0) * 2.0
+	} else {
+		// 300+ → 9-10 (CRITICAL)
+		// Logarithmic scaling for very high scores
+		normalized = 9.0 + math.Min(1.0, math.Log10(rawScore/300.0))
+	}
+
+	// Cap at 10
+	if normalized > 10 {
+		normalized = 10
+	}
+
+	return normalized
+}
+
+// parseASN parses ASN from "AS4760" format to uint32
+// Returns 0 if parsing fails
+func parseASN(asnString string) uint32 {
+	// Remove "AS" prefix if present
+	asnString = strings.TrimPrefix(asnString, "AS")
+	asnString = strings.TrimPrefix(asnString, "as")
+	asnString = strings.TrimSpace(asnString)
+
+	// Parse to uint32
+	asn, err := strconv.ParseUint(asnString, 10, 32)
+	if err != nil {
+		log.Warnf("Failed to parse ASN from '%s': %v", asnString, err)
+		return 0
+	}
+
+	return uint32(asn)
 }
