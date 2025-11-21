@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/onefirewall/classifier/internal/classifier"
@@ -14,20 +15,25 @@ import (
 // Handler manages HTTP request handlers
 type Handler struct {
 	classifier *classifier.Classifier
+	startTime  time.Time
 }
 
 // NewHandler creates a new API handler
 func NewHandler(c *classifier.Classifier) *Handler {
 	return &Handler{
 		classifier: c,
+		startTime:  time.Now(),
 	}
 }
 
 // HealthCheck handles health check requests
 func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
-	response := map[string]string{
-		"status": "ok",
+	uptime := time.Since(h.startTime)
+	response := map[string]interface{}{
+		"status":  "ok",
 		"service": "onefirewall-classifier",
+		"uptime":  uptime.String(),
+		"version": "2.0.0",
 	}
 	respondJSON(w, http.StatusOK, response)
 }

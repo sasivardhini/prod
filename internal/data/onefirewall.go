@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 // OneFirewallClient manages interactions with OneFirewall API
 type OneFirewallClient struct {
 	baseURL    string
+	apiKey     string
 	httpClient *http.Client
 	cache      map[string]*models.MaliciousIP
 	mu         sync.RWMutex
@@ -24,21 +26,25 @@ type OneFirewallClient struct {
 type OneFirewallResponse struct {
 	IP          string  `json:"ip"`
 	Score       float64 `json:"score"`
+	CrimeScore  float64 `json:"crime_score"`
 	ASN         uint32  `json:"asn"`
 	Country     string  `json:"country"`
+	CountryCode string  `json:"country_code"`
 	FirstSeen   string  `json:"first_seen"`
 	LastSeen    string  `json:"last_seen"`
 	Description string  `json:"description"`
+	Events      int     `json:"events"`
 }
 
 // NewOneFirewallClient creates a new OneFirewall API client
-func NewOneFirewallClient(baseURL string) *OneFirewallClient {
+func NewOneFirewallClient(baseURL, apiKey string) *OneFirewallClient {
 	if baseURL == "" {
 		baseURL = "https://app.onefirewall.com"
 	}
 
 	return &OneFirewallClient{
 		baseURL: baseURL,
+		apiKey:  apiKey,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -56,14 +62,34 @@ func (c *OneFirewallClient) GetIPInfo(ip string) (*models.MaliciousIP, error) {
 	}
 	c.mu.RUnlock()
 
+	// Don't make API calls if no API key is configured
+	if c.apiKey == "" {
+		return nil, fmt.Errorf("no API key configured")
+	}
+
 	// Make API request
 	url := fmt.Sprintf("%s/api/search?ioc=%s", c.baseURL, ip)
-	resp, err := c.httpClient.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Add authentication header
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		log.Warnf("Failed to fetch IP info for %s: %v", ip, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// IP not found in OneFirewall database - this is not an error
+		log.Debugf("IP %s not found in OneFirewall database", ip)
+		return nil, nil
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		log.Warnf("OneFirewall API returned status %d for IP %s", resp.StatusCode, ip)
@@ -78,17 +104,30 @@ func (c *OneFirewallClient) GetIPInfo(ip string) (*models.MaliciousIP, error) {
 	var apiResp OneFirewallResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
 		log.Warnf("Failed to parse OneFirewall response for %s: %v", ip, err)
+		log.Debugf("Response body: %s", string(body))
 		return nil, err
 	}
 
 	firstSeen, _ := time.Parse(time.RFC3339, apiResp.FirstSeen)
 	lastSeen, _ := time.Parse(time.RFC3339, apiResp.LastSeen)
 
+	// Use CrimeScore if available, otherwise fall back to Score
+	score := apiResp.Score
+	if apiResp.CrimeScore > 0 {
+		score = apiResp.CrimeScore
+	}
+
+	// Get country code
+	countryCode := apiResp.CountryCode
+	if countryCode == "" {
+		countryCode = apiResp.Country
+	}
+
 	maliciousIP := &models.MaliciousIP{
 		IP:          apiResp.IP,
-		Score:       apiResp.Score,
+		Score:       score,
 		ASN:         apiResp.ASN,
-		CountryCode: apiResp.Country,
+		CountryCode: countryCode,
 		FirstSeen:   firstSeen,
 		LastSeen:    lastSeen,
 	}
@@ -97,6 +136,8 @@ func (c *OneFirewallClient) GetIPInfo(ip string) (*models.MaliciousIP, error) {
 	c.mu.Lock()
 	c.cache[ip] = maliciousIP
 	c.mu.Unlock()
+
+	log.Infof("Fetched IP %s from OneFirewall: score=%.2f, ASN=%d, country=%s", ip, score, apiResp.ASN, countryCode)
 
 	return maliciousIP, nil
 }
@@ -157,13 +198,55 @@ func (c *OneFirewallClient) GetMaliciousIPsByCountry(country string) []models.Ma
 }
 
 // IsMalicious checks if an IP is in the malicious cache
+// If not in cache and API key is available, fetches from OneFirewall API
 func (c *OneFirewallClient) IsMalicious(ip string) (bool, float64) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	cached, ok := c.cache[ip]
+	c.mu.RUnlock()
 
-	if malIP, ok := c.cache[ip]; ok {
-		return true, malIP.Score
+	if ok {
+		return true, cached.Score
+	}
+
+	// Try to fetch from API if configured
+	if c.apiKey != "" {
+		malIP, err := c.GetIPInfo(ip)
+		if err == nil && malIP != nil {
+			return true, malIP.Score
+		}
 	}
 
 	return false, 0
+}
+
+// LoadMaliciousIPsFromFile loads malicious IPs from a JSON file
+func (c *OneFirewallClient) LoadMaliciousIPsFromFile(filepath string) error {
+	file, err := os.Open(filepath)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	var ips []models.MaliciousIP
+	if err := json.NewDecoder(file).Decode(&ips); err != nil {
+		return fmt.Errorf("failed to decode JSON: %w", err)
+	}
+
+	c.LoadMaliciousIPs(ips)
+	return nil
+}
+
+// RefreshCache clears the cache to force fresh API calls
+func (c *OneFirewallClient) RefreshCache() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache = make(map[string]*models.MaliciousIP)
+	log.Info("OneFirewall cache cleared")
+}
+
+// GetCacheSize returns the number of cached malicious IPs
+func (c *OneFirewallClient) GetCacheSize() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.cache)
 }

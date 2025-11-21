@@ -223,14 +223,46 @@ func ipToUint32(ip net.IP) uint32 {
 	return binary.BigEndian.Uint32(ip)
 }
 
-// IsNetworkAddress checks if an IP is the network address (first IP in range)
+// IsNetworkAddress checks if an IP is a network address (last octet is 0)
+// Network addresses are not routable and should return NONE
 func IsNetworkAddress(ip net.IP, ipRange *models.IPRange) bool {
-	return ipToUint32(ip) == ipRange.StartIPInt
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return false
+	}
+
+	// Check if last octet is 0 (network address)
+	// This handles cases like x.x.x.0 within any subnet
+	if ipv4[3] == 0 {
+		ipInt := ipToUint32(ip)
+		// Verify IP is within the given range
+		if ipInt >= ipRange.StartIPInt && ipInt <= ipRange.EndIPInt {
+			return true
+		}
+	}
+
+	return false
 }
 
-// IsBroadcastAddress checks if an IP is the broadcast address (last IP in range)
+// IsBroadcastAddress checks if an IP is a broadcast address (last octet is 255)
+// Broadcast addresses are not routable and should return NONE
 func IsBroadcastAddress(ip net.IP, ipRange *models.IPRange) bool {
-	return ipToUint32(ip) == ipRange.EndIPInt
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return false
+	}
+
+	// Check if last octet is 255 (broadcast address)
+	// This handles cases like x.x.x.255 within any subnet
+	if ipv4[3] == 255 {
+		ipInt := ipToUint32(ip)
+		// Verify IP is within the given range
+		if ipInt >= ipRange.StartIPInt && ipInt <= ipRange.EndIPInt {
+			return true
+		}
+	}
+
+	return false
 }
 
 // GetSubnetSize calculates the number of IPs in a subnet

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/onefirewall/classifier/internal/api"
@@ -17,8 +18,10 @@ func main() {
 	// Command line flags
 	port := flag.String("port", "8080", "Server port")
 	ipdbFile := flag.String("ipdb", "", "Path to IP database file (TSV format)")
-	maliciousFile := flag.String("malicious", "", "Path to malicious IPs file (optional)")
+	maliciousFile := flag.String("malicious", "", "Path to malicious IPs file (JSON format)")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	apiKey := flag.String("api-key", "", "OneFirewall API key (can also use ONEFIREWALL_API_KEY env var)")
+	baseURL := flag.String("onefirewall-url", "https://app.onefirewall.com", "OneFirewall base URL")
 	flag.Parse()
 
 	// Configure logging
@@ -33,6 +36,18 @@ func main() {
 
 	log.Info("Starting OneFirewall Classifier Service...")
 
+	// Get API key from environment if not provided via flag
+	oneFirewallAPIKey := *apiKey
+	if oneFirewallAPIKey == "" {
+		oneFirewallAPIKey = os.Getenv("ONEFIREWALL_API_KEY")
+	}
+
+	if oneFirewallAPIKey != "" {
+		log.Info("OneFirewall API key configured - real-time API integration enabled")
+	} else {
+		log.Warn("No OneFirewall API key provided - will use cached data only")
+	}
+
 	// Initialize IP database
 	ipDB := data.NewIPDB()
 
@@ -46,16 +61,24 @@ func main() {
 		loadSampleData(ipDB)
 	}
 
-	// Initialize OneFirewall client
-	ofClient := data.NewOneFirewallClient("https://app.onefirewall.com")
+	// Initialize OneFirewall client with API key
+	ofClient := data.NewOneFirewallClient(*baseURL, oneFirewallAPIKey)
 
 	// Load malicious IPs if provided
 	if *maliciousFile != "" {
 		log.Infof("Loading malicious IPs from: %s", *maliciousFile)
-		// TODO: Implement loading from file
+		if err := ofClient.LoadMaliciousIPsFromFile(*maliciousFile); err != nil {
+			log.Errorf("Failed to load malicious IPs from file: %v", err)
+			log.Warn("Falling back to sample malicious data...")
+			loadSampleMaliciousIPs(ofClient, ipDB)
+		}
 	} else {
-		log.Warn("No malicious IPs file specified. Using sample malicious data...")
-		loadSampleMaliciousIPs(ofClient, ipDB)
+		if oneFirewallAPIKey == "" {
+			log.Warn("No malicious IPs file specified and no API key. Using sample malicious data...")
+			loadSampleMaliciousIPs(ofClient, ipDB)
+		} else {
+			log.Info("No malicious IPs file specified. Will fetch data from OneFirewall API on-demand.")
+		}
 	}
 
 	// Initialize classifier
