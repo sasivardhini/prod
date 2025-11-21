@@ -9,12 +9,15 @@ This service analyzes IP addresses, ASNs, and countries to determine the likelih
 ## Features
 
 - **Fast IP Classification**: Instantly classify any IPv4 address
+- **Real OneFirewall Integration**: Live threat intelligence from OneFirewall API
 - **ASN-Level Analysis**: Evaluate entire Autonomous Systems
 - **Country-Level Intelligence**: Assess country-wide threat patterns
 - **Subnet Analysis**: Deep analysis of network ranges
 - **RESTful API**: Easy-to-use HTTP API endpoints
-- **Scoring Algorithm**: Sophisticated multi-factor scoring system
+- **Enhanced Scoring Algorithm**: Sophisticated multi-factor scoring aligned with crime scores
+- **API Authentication**: Secure Bearer token authentication
 - **Sample Data**: Built-in sample data for quick testing
+- **Production Ready**: Environment variables, file loading, and caching
 
 ## Architecture
 
@@ -35,8 +38,10 @@ The system consists of several key components:
 ### Basic Rules
 
 1. **AS=0 (Not-Routed)** → NONE
-2. **Network Address** (first IP) → NONE
-3. **Broadcast Address** (last IP) → NONE
+2. **Network Address** (IPs ending in .0) → NONE
+3. **Broadcast Address** (IPs ending in .255) → NONE
+
+> **Note**: Network and broadcast addresses are correctly identified for ALL subnets within a range. For example, in range 1.0.1.0-1.0.3.255, the following IPs return NONE: 1.0.1.0, 1.0.1.255, 1.0.2.0, 1.0.2.255, 1.0.3.0, 1.0.3.255
 
 ### Intelligence-Based Classification
 
@@ -172,11 +177,40 @@ make run
 
 The server will start on port 8080 with built-in sample data.
 
+### Running with Real OneFirewall API
+
+**Step 1: Set up your API key**
+
+```bash
+export ONEFIREWALL_API_KEY="your-api-key-here"
+```
+
+**Step 2: Download IP database (optional but recommended)**
+
+```bash
+wget https://iptoasn.com/data/ip2asn-v4.tsv.gz
+gunzip ip2asn-v4.tsv.gz
+```
+
+**Step 3: Run the service**
+
+```bash
+./build/onefirewall-classifier -ipdb ip2asn-v4.tsv -log-level info
+```
+
+The service will now fetch real-time malicious IP data from OneFirewall on-demand!
+
 ### Running with Custom Data
 
 ```bash
 # With IP database from iptoasn.com
 ./build/onefirewall-classifier -ipdb data/ip2asn-v4.tsv
+
+# With OneFirewall API key
+./build/onefirewall-classifier -api-key "your-key" -ipdb data/ip2asn-v4.tsv
+
+# With malicious IPs JSON file
+./build/onefirewall-classifier -malicious data/malicious-ips.json
 
 # With custom port
 ./build/onefirewall-classifier -port 9090
@@ -184,11 +218,12 @@ The server will start on port 8080 with built-in sample data.
 # With debug logging
 ./build/onefirewall-classifier -log-level debug
 
-# All options
+# Production configuration
+export ONEFIREWALL_API_KEY="your-key"
 ./build/onefirewall-classifier \
   -port 8080 \
-  -ipdb data/ip2asn-v4.tsv \
-  -malicious data/malicious-ips.json \
+  -ipdb /data/ip2asn-v4.tsv \
+  -malicious /data/malicious-ips.json \
   -log-level info
 ```
 
@@ -196,8 +231,14 @@ The server will start on port 8080 with built-in sample data.
 
 - `-port`: Server port (default: 8080)
 - `-ipdb`: Path to IP database file in TSV format
-- `-malicious`: Path to malicious IPs file (optional)
+- `-malicious`: Path to malicious IPs file in JSON format (optional)
+- `-api-key`: OneFirewall API key (can also use `ONEFIREWALL_API_KEY` env var)
+- `-onefirewall-url`: OneFirewall base URL (default: https://app.onefirewall.com)
 - `-log-level`: Log level - debug, info, warn, error (default: info)
+
+### Environment Variables
+
+- `ONEFIREWALL_API_KEY`: OneFirewall API key for real-time threat intelligence
 
 ## Data Sources
 

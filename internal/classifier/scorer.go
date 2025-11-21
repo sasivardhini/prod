@@ -53,6 +53,7 @@ func (s *Scorer) ScoreToConfidence(score float64) models.ConfidenceLevel {
 }
 
 // CalculateSubnetConfidence calculates confidence for a subnet
+// Based on OneFirewall's crime score concept: more malicious IPs = higher confidence
 func (s *Scorer) CalculateSubnetConfidence(stats *models.SubnetStats) (models.ConfidenceLevel, float64) {
 	if stats.MaliciousCount == 0 {
 		return models.ConfidenceNone, 0
@@ -69,22 +70,42 @@ func (s *Scorer) CalculateSubnetConfidence(stats *models.SubnetStats) (models.Co
 	subnetSizeFactor := 1.0
 	if stats.TotalIPs > 0 {
 		// Inverse relationship: smaller subnet = higher factor
+		// For small subnets (/24 or smaller), this gives high weight
 		subnetSizeFactor = math.Max(0.1, 1.0-math.Log10(float64(stats.TotalIPs))/5.0)
 	}
 
-	// Normalize average score to 0-10 scale
+	// Normalize average score to 0-10 scale (OneFirewall crime scores)
 	normalizedAvgScore := math.Min(10.0, stats.AvgScore)
 	normalizedMaxScore := math.Min(10.0, stats.MaxScore)
 
 	// Weighted score calculation
-	score := (density * s.SubnetDensityWeight * 10.0) +
-		(normalizedAvgScore * s.AvgScoreWeight) +
+	// Priority: average score > density > max score > subnet size
+	score := (normalizedAvgScore * s.AvgScoreWeight) +
+		(density * s.SubnetDensityWeight * 10.0) +
 		(normalizedMaxScore * s.MaxScoreWeight) +
 		(subnetSizeFactor * s.SubnetSizeWeight * 10.0)
 
-	// Apply multiplier based on density for small subnets
-	if stats.TotalIPs <= 256 && density > 0.05 { // More than 5% malicious in small subnet
-		score *= 1.5
+	// Apply multipliers based on malicious IP count and density
+	// Logic: If subnet has many malicious IPs, it's more dangerous
+	if stats.TotalIPs <= 256 { // /24 or smaller subnet
+		if density > 0.20 { // More than 20% malicious
+			score *= 1.8
+		} else if density > 0.10 { // More than 10% malicious
+			score *= 1.5
+		} else if density > 0.05 { // More than 5% malicious
+			score *= 1.3
+		}
+	} else if stats.TotalIPs <= 65536 { // /16 subnet
+		if stats.MaliciousCount >= 100 {
+			score *= 1.4
+		} else if stats.MaliciousCount >= 50 {
+			score *= 1.2
+		}
+	}
+
+	// Boost score if we have high-severity malicious IPs (score >= 8)
+	if stats.MaxScore >= 8.0 {
+		score *= 1.15
 	}
 
 	// Cap the score at 10
