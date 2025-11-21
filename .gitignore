@@ -22,6 +22,7 @@ data/*.csv
 data/*.json
 !data/.gitkeep
 !data/ip2asn-v4.tsv
+!data/ip2country-v4.tsv
 
 # Config files with secrets
 configs/*.secret.*
